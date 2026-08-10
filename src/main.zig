@@ -15,6 +15,10 @@ const usage =
     \\                            jsonl's data as integers, for consumers
     \\                            that cannot afford a JSON parse per frame
     \\  --target NAME             sink to follow (default: the default sink)
+    \\  --app NAME                capture one application instead of the sink,
+    \\                            matched loosely on its name. overrides
+    \\                            --target. silent while it is not playing,
+    \\                            and attaches on its own when it starts
     \\  --bands N                 band count (default 44)
     \\  --low HZ                  lowest band edge (default 40)
     \\  --high HZ                 highest band edge (default 12000)
@@ -63,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     var format: cadence.Format = .jsonl;
     var max: u32 = 100;
     var target: ?[:0]const u8 = null;
+    var app: ?[:0]const u8 = null;
 
     var it = init.minimal.args.iterate();
     _ = it.next();
@@ -84,6 +89,8 @@ pub fn main(init: std.process.Init) !void {
                 fatal(io, "unknown format '{s}'", .{v});
         } else if (std.mem.eql(u8, arg, "--target")) {
             target = Need.val(&it, "--target", io);
+        } else if (std.mem.eql(u8, arg, "--app")) {
+            app = Need.val(&it, "--app", io);
         } else if (std.mem.eql(u8, arg, "--bands")) {
             opts.bands = std.fmt.parseInt(usize, Need.val(&it, "--bands", io), 10) catch
                 fatal(io, "--bands wants a number", .{});
@@ -145,8 +152,12 @@ pub fn main(init: std.process.Init) !void {
     // cost samples
     const ring_frames: u32 = @intCast(std.math.ceilPowerOfTwoAssert(usize, opts.window * 4));
 
-    const cap = c.cadence_open(if (target) |t| t.ptr else null, opts.rate, ring_frames) orelse
-        fatal(io, "could not allocate the capture", .{});
+    const cap = c.cadence_open(
+        if (target) |t| t.ptr else null,
+        if (app) |a| a.ptr else null,
+        opts.rate,
+        ring_frames,
+    ) orelse fatal(io, "could not allocate the capture", .{});
     defer c.cadence_close(cap);
 
     if (c.cadence_start(cap) != 0)

@@ -13,8 +13,18 @@ typedef struct cadence_capture cadence_capture;
 
 /* target may be NULL for the default sink. A trailing ".monitor" is stripped:
  * capturing a sink is a property of the stream, not a different node name.
- * ring_frames must be a power of two. */
-cadence_capture *cadence_open(const char *target, uint32_t rate, uint32_t ring_frames);
+ * ring_frames must be a power of two.
+ *
+ * app, when non-NULL, captures one application instead of the sink - matched
+ * as a case-insensitive substring of its application.name, node.name or
+ * media.name. It overrides target. Nothing is captured while no such
+ * application is playing, and it attaches by itself when one appears. */
+cadence_capture *cadence_open(const char *target, const char *app, uint32_t rate,
+			      uint32_t ring_frames);
+
+/* Whether an app named by cadence_open is currently attached. Always 1 when
+ * capturing a sink. */
+int cadence_attached(const cadence_capture *c);
 
 /* Connects and starts the loop on its own thread. 0 on success. */
 int cadence_start(cadence_capture *c);
