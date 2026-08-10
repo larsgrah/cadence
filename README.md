@@ -8,9 +8,10 @@ differing only in band count and smoothing, and each doing its own fft of the
 same audio.
 
 ```
-cadence --format cava --bands 44                 # the visualiser feed
-cadence --format amp                             # the aurora's scalar
-cadence --format jsonl                           # bands, amp, flux, onset
+cadence --format packed                          # what the shell reads
+cadence --format jsonl                           # the same, readable
+cadence --format cava --bands 44                 # drop-in for a cava pipe
+cadence --format amp                             # just the scalar
 ```
 
 ## Why it exists
@@ -27,8 +28,12 @@ else's process the two things that mattered were not reachable:
   by level swells with volume. An aurora driven by onset hits on the kick,
   which is a visibly different thing
 
-Measured against the two cavas it replaces: 0.6% of a core for 44 bands at
-100fps, against their combined 1.0% at 30fps.
+The process itself is 0.55-0.65% of a core for 44 bands, against the two
+cavas' combined 1.0%. **The whole-shell picture is a wash**, not a win - the
+consumer now reads 60 frames a second instead of 30, and that costs about
+what the second cava did. What it buys is the rate and the onset, not
+cycles. There is a fuller account in the shell's own docs, including the
+±3% sampling noise that makes single measurements here worthless.
 
 ## Output
 
@@ -37,6 +42,17 @@ separated. Anything already parsing a cava pipe takes it unchanged.
 
 `--format amp` is one float per line, for a consumer that only wants the
 scalar.
+
+`--format packed` is jsonl's data as `;`-separated integers, `amp;flux;
+onset;b0;...;bN`, everything 0..1000 and onset 0 or 1:
+
+```
+851;1000;0;1000;906;874;542;482;408;411;244
+```
+
+It exists because `JSON.parse` per frame is too expensive in a QML consumer
+to run at 60fps, and because the scalars can be read off the front of the
+line without touching the bands at all.
 
 `--format jsonl` is the one cava has no way to express:
 

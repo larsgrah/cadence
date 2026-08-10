@@ -10,7 +10,10 @@ const usage =
     \\
     \\usage: cadence [options]
     \\
-    \\  --format cava|jsonl|amp   output shape (default jsonl)
+    \\  --format cava|jsonl|amp|packed
+    \\                            output shape (default jsonl). packed is
+    \\                            jsonl's data as integers, for consumers
+    \\                            that cannot afford a JSON parse per frame
     \\  --target NAME             sink to follow (default: the default sink)
     \\  --bands N                 band count (default 44)
     \\  --low HZ                  lowest band edge (default 40)
