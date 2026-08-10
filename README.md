@@ -43,11 +43,12 @@ separated. Anything already parsing a cava pipe takes it unchanged.
 `--format amp` is one float per line, for a consumer that only wants the
 scalar.
 
-`--format packed` is jsonl's data as `;`-separated integers, `amp;flux;
-onset;b0;...;bN`, everything 0..1000 and onset 0 or 1:
+`--format packed` is jsonl's data as `;`-separated integers,
+`amp;flux;onset;bpm;phase;conf;b0;...;bN` - everything thousandths except
+onset (0 or 1) and bpm (tenths):
 
 ```
-851;1000;0;1000;906;874;542;482;408;411;244
+705;411;0;1372;143;245;821;524;271;354
 ```
 
 It exists because `JSON.parse` per frame is too expensive in a QML consumer
@@ -57,7 +58,8 @@ line without touching the bands at all.
 `--format jsonl` is the one cava has no way to express:
 
 ```json
-{"amp":0.34,"flux":0.15,"onset":false,"bands":[0.10,0.29,0.84,...]}
+{"amp":0.34,"flux":0.15,"onset":false,"bpm":128.4,"phase":0.21,
+ "conf":0.31,"bands":[0.10,0.29,0.84,...]}
 ```
 
 - `amp` is the whole mix, 0..1, weighted towards the bottom third. A flat
@@ -72,11 +74,53 @@ spectrum. Full-spectrum flux fires on every hi-hat, which is correct onset
 detection and useless for driving something that should look like it follows
 the music.
 
-What comes out is still every bass transient, not every beat. On a busy
-bassline that is 3 or more a second. Turning onsets into beats needs a tempo
-model on top, which is the obvious next thing and is not here yet. The three
-knobs to tune in the meantime are `--onset-hz`, `--onset-threshold` and
-`--onset-refractory`.
+What comes out is still every bass transient, not every beat - on a busy
+bassline that is 3 or more a second. `--onset-hz`, `--onset-threshold` and
+`--onset-refractory` tune it.
+
+## Tempo
+
+`bpm`, `phase` and `conf`. Onsets on their own are reactive: something
+happens and a consumer jerks in response, and nothing ties one beat to the
+next. A period and a phase let a consumer know where the next beat lands
+before it arrives, so it can move continuously in time with the music.
+
+Autocorrelation over six seconds of onset strength for the period, a phase
+accumulator nudged by onsets for the phase. Locks on a real track in about
+seven seconds, costs 0.15% of a core.
+
+**Confidence is a correlation coefficient**, which is the only reason it
+means anything: the autocorrelation is normalised by the variance, so a
+spike train scores near 1 against itself a period later and white noise sits
+near `1/sqrt(pairs)`. Raw covariances have no scale to threshold, and the
+first version cheerfully reported 0.9 on noise.
+
+Autocorrelation cannot tell a beat from every other beat, so it locks to
+half or double as readily as to the tempo. Whichever candidate lands nearest
+120bpm wins.
+
+## One application
+
+`--app spotify` captures that application instead of the sink, matched
+loosely on its name. It is silent while nothing matches and attaches by
+itself when the application starts.
+
+**A target you ask for is not a target you get.** `PW_KEY_TARGET_OBJECT`
+pointed at an application's node is silently ignored - the session manager
+links capture streams to *sources*, and an application playing audio is a
+`Stream/Output/Audio`. Recording with the target set gives silence. So the
+links are made by hand through the link factory: watch the registry for a
+matching node, find its output ports, link each into our own input port.
+Several outputs into one input is how pipewire mixes, so a stereo
+application arrives already summed.
+
+In app mode autoconnect has to be **off**, or the session manager links the
+stream to a source and it sits there analysing the microphone while waiting
+for the application to appear.
+
+**An idle application produces no frames at all**, not frames of silence. A
+consumer that only watches the numbers will hold the last one forever, so it
+needs its own timeout.
 
 ## Scaling
 
