@@ -9,7 +9,8 @@ pub const Format = enum {
     jsonl,
     /// just the scalar, one float per line, for the amp consumer
     amp,
-    /// `amp;flux;onset;b0;...;bN` as integers 0..1000, onset 0 or 1.
+    /// `amp;flux;onset;bpm;phase;conf;b0;...;bN` as integers. everything is
+    /// thousandths except onset (0 or 1) and bpm (tenths).
     ///
     /// jsonl is the nice one to read and the expensive one to parse - a QML
     /// consumer doing JSON.parse on it costs about 0.25% of a core per line
@@ -40,8 +41,9 @@ pub const Writer = struct {
                 try self.out.writeByte('\n');
             },
             .jsonl => {
-                try self.out.print("{{\"amp\":{d:.4},\"flux\":{d:.4},\"onset\":{},\"bands\":[", .{
-                    f.amp, f.flux, f.onset,
+                try self.out.print("{{\"amp\":{d:.4},\"flux\":{d:.4},\"onset\":{}," ++
+                    "\"bpm\":{d:.1},\"phase\":{d:.4},\"conf\":{d:.3},\"bands\":[", .{
+                    f.amp, f.flux, f.onset, f.bpm, f.phase, f.tempo_conf,
                 });
                 for (f.bands, 0..) |v, i| {
                     if (i != 0) try self.out.writeByte(',');
@@ -51,8 +53,15 @@ pub const Writer = struct {
             },
             .amp => try self.out.print("{d:.4}\n", .{f.amp}),
             .@"packed" => {
-                try self.out.print("{d};{d};{d}", .{
-                    milli(f.amp), milli(f.flux), @intFromBool(f.onset),
+                // bpm is tenths, so a display does not jitter between two
+                // integers. everything else is thousandths
+                try self.out.print("{d};{d};{d};{d};{d};{d}", .{
+                    milli(f.amp),
+                    milli(f.flux),
+                    @intFromBool(f.onset),
+                    @as(u32, @intFromFloat(@round(@max(f.bpm, 0) * 10))),
+                    milli(f.phase),
+                    milli(f.tempo_conf),
                 });
                 for (f.bands) |v| try self.out.print(";{d}", .{milli(v)});
                 try self.out.writeByte('\n');

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Fft = @import("fft.zig").Fft;
+const TempoMod = @import("tempo.zig");
 
 pub const Scale = enum {
     /// raw magnitude. bass carries most of the energy in music, so the top
@@ -58,6 +59,12 @@ pub const Frame = struct {
     flux: f32,
     /// flux crossed the adaptive threshold and we are past the refractory gap
     onset: bool,
+    /// estimated tempo, 0 when nothing convincing is there
+    bpm: f32,
+    /// 0..1 wrapping, 0 on the beat. only meaningful while `bpm` is nonzero
+    phase: f32,
+    /// how sure the tempo estimate is, 0..1
+    tempo_conf: f32,
 };
 
 pub const Analyzer = struct {
@@ -89,6 +96,8 @@ pub const Analyzer = struct {
     refractory: usize = 0,
     onset_bin: usize = 1,
 
+    tempo: TempoMod.Tempo,
+
     pub fn init(gpa: std.mem.Allocator, opts: Options) !Analyzer {
         var self: Analyzer = .{
             .opts = opts,
@@ -103,6 +112,7 @@ pub const Analyzer = struct {
             .band_hi = undefined,
             .out_bands = undefined,
             .flux_hist = undefined,
+            .tempo = undefined,
         };
 
         self.fft = try Fft.init(gpa, opts.window);
@@ -124,6 +134,13 @@ pub const Analyzer = struct {
         const hist_len = @max(8, (opts.rate * 6 / 10) / opts.hop);
         self.flux_hist = try gpa.alloc(f32, hist_len);
         @memset(self.flux_hist, 0);
+
+        // the tempo model runs on the same onset strength the detector uses,
+        // one value per hop
+        self.tempo = try TempoMod.Tempo.init(gpa, .{
+            .fps = @as(f32, @floatFromInt(opts.rate)) / @as(f32, @floatFromInt(opts.hop)),
+        });
+        errdefer self.tempo.deinit(gpa);
 
         // hann. periodic rather than symmetric, since consecutive frames
         // overlap and a symmetric window double-counts the endpoint
@@ -169,6 +186,7 @@ pub const Analyzer = struct {
         gpa.free(self.band_hi);
         gpa.free(self.out_bands);
         gpa.free(self.flux_hist);
+        self.tempo.deinit(gpa);
         self.* = undefined;
     }
 
@@ -255,11 +273,19 @@ pub const Analyzer = struct {
         const norm_flux = self.normalizedFlux(flux);
         const onset = self.detectOnset(bass_flux);
 
+        // the tempo model gets the same onset strength the detector saw, not
+        // the boolean - a period comes out of the shape of the signal, and
+        // thresholding it first throws most of that away
+        const beat = self.tempo.push(bass_flux, onset);
+
         return .{
             .bands = self.out_bands,
             .amp = amp,
             .flux = norm_flux,
             .onset = onset,
+            .bpm = beat.bpm,
+            .phase = beat.phase,
+            .tempo_conf = beat.confidence,
         };
     }
 
