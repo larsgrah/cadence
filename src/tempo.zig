@@ -2,15 +2,13 @@ const std = @import("std");
 
 /// Tempo from the onset strength function.
 ///
-/// Onsets on their own are reactive: something happens, and a consumer jerks
-/// in response. That is what "the visualiser looks hectic" actually means -
-/// every detection is a separate event and nothing ties them together.
-///
-/// A period plus a phase turns that into something a consumer can *predict*.
-/// It knows where the next beat lands before it arrives, so it can move
-/// continuously in time with the music instead of twitching when a transient
-/// shows up. It also makes a spurious onset harmless: one bad detection
-/// barely moves an estimate built from six seconds of history.
+/// Onsets on their own are reactive: something happens and a consumer jerks
+/// in response, with nothing tying one detection to the next. A period plus
+/// a phase lets a consumer know where the next beat lands before it
+/// arrives, so it can move continuously in time with the music instead of
+/// twitching when a transient shows up. It also makes a spurious onset
+/// harmless, since one bad detection barely moves an estimate built from
+/// six seconds of history.
 ///
 /// Autocorrelation for the period, a phase accumulator nudged by onsets for
 /// the phase. Both are cheap - the autocorrelation only runs a couple of
@@ -34,7 +32,7 @@ pub const Options = struct {
     /// takes a few beats to converge and then ignores the odd bad one
     phase_pull: f32 = 0.12,
     /// below this the estimate is not worth showing. autocorrelation always
-    /// returns *a* peak, including on speech and silence
+    /// returns some peak, including on speech and silence
     min_confidence: f32 = 0.18,
 };
 
@@ -125,11 +123,10 @@ pub const Tempo = struct {
             self.phase += 1.0 / self.period_frames;
             while (self.phase >= 1.0) self.phase -= 1.0;
 
-            // a phase locked loop, and the loop is the point. an onset says
-            // "a beat is about now", so pull the phase towards it by a
-            // fraction rather than setting it - that is what makes the
-            // estimate survive a detector that fires on things that are not
-            // beats
+            // a phase locked loop. an onset says "a beat is about now", so
+            // pull the phase towards it by a fraction instead of setting it,
+            // and the estimate survives a detector that fires on things
+            // that are not beats
             if (onset and self.confidence >= self.opts.min_confidence) {
                 // error in [-0.5, 0.5): how far the phase is from the beat
                 var err = self.phase;
@@ -161,11 +158,11 @@ pub const Tempo = struct {
         mean /= @floatFromInt(n);
 
         // divide through by the variance and the scores become correlation
-        // coefficients rather than raw covariances. that is what makes the
-        // number mean something on its own: a spike train correlates near 1
-        // with itself a period later, and white noise sits around
-        // 1/sqrt(pairs), which is a few hundredths. without this there is no
-        // threshold that separates music from noise
+        // coefficients rather than raw covariances, so the number means
+        // something on its own: a spike train correlates near 1 with itself
+        // a period later, and white noise sits around 1/sqrt(pairs), which
+        // is a few hundredths. without this there is no threshold that
+        // separates music from noise
         var variance: f32 = 0;
         for (self.odf) |v| variance += (v - mean) * (v - mean);
         variance /= @floatFromInt(n);
@@ -207,7 +204,7 @@ pub const Tempo = struct {
         best_lag = self.preferOctave(best_lag);
         const idx = best_lag - self.min_lag;
 
-        // the coefficient at the chosen lag *is* the confidence
+        // the coefficient at the chosen lag doubles as the confidence
         const cand_conf = std.math.clamp(self.score[idx], 0, 1);
 
         // refine the peak with a parabola through its neighbours, so the bpm
