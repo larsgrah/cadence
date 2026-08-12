@@ -14,6 +14,10 @@ const usage =
     \\                            output shape (default jsonl). packed is
     \\                            jsonl's data as integers, for consumers
     \\                            that cannot afford a JSON parse per frame
+    \\  --file PATH               analyse a wav instead of capturing. runs as
+    \\                            fast as it can and exits at the end of the
+    \\                            file, so a run is repeatable and can be
+    \\                            diffed. the file's own rate wins over --rate
     \\  --target NAME             sink to follow (default: the default sink)
     \\  --app NAME                capture one application instead of the sink,
     \\                            matched loosely on its name. overrides
@@ -26,7 +30,12 @@ const usage =
     \\  --window N                fft size, power of two (default 2048)
     \\  --hop N                   samples between frames (default 480, so 100fps)
     \\  --max N                   cava format's integer range (default 100)
-    \\  --onset-hz HZ             onsets use flux below this (default 200)
+    \\  --onset-hz HZ             onsets use the bins below this (default 200)
+    \\  --odf flux|complex        what onsets and tempo run on (default flux,
+    \\                            positive magnitude change). complex also
+    \\                            reads phase, so it sees a note that starts
+    \\                            without getting louder - which a kick under
+    \\                            200Hz never is, so it changes nothing here
     \\  --onset-threshold X       times the running mean to fire (default 1.8)
     \\  --onset-refractory MS     silence after a hit (default 110)
     \\  --scale db|linear         band scaling (default db)
@@ -51,6 +60,61 @@ const Emitter = struct {
     }
 };
 
+fn checkNyquist(io: std.Io, opts: cadence.Options) void {
+    if (opts.high_hz > @as(f32, @floatFromInt(opts.rate)) / 2)
+        fatal(io, "--high is above nyquist for rate {d}", .{opts.rate});
+}
+
+/// Offline path. Same analyzer, same output, no pipewire anywhere near it -
+/// which is the point, since a run over a file is repeatable and a capture is
+/// not.
+fn runFile(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    path: [:0]const u8,
+    opts_in: cadence.Options,
+    format: cadence.Format,
+    max: u32,
+) !void {
+    var f = std.Io.Dir.cwd().openFile(io, path, .{}) catch |e|
+        fatal(io, "cannot open {s}: {s}", .{ path, @errorName(e) });
+    defer f.close(io);
+
+    var in_buf: [64 * 1024]u8 = undefined;
+    var fr = f.reader(io, &in_buf);
+
+    var dec = cadence.wav.Decoder.init(&fr.interface) catch |e|
+        fatal(io, "{s}: {s}", .{ path, @errorName(e) });
+
+    var opts = opts_in;
+    // the file says what rate it is. arguing with it would only put a
+    // resampler in front of the thing being measured
+    opts.rate = dec.rate;
+    checkNyquist(io, opts);
+
+    var analyzer = try cadence.Analyzer.init(gpa, opts);
+    defer analyzer.deinit(gpa);
+
+    var out_buf: [64 * 1024]u8 = undefined;
+    var out_w = std.Io.File.stdout().writer(io, &out_buf);
+    var emitter: Emitter = .{ .w = .{ .out = &out_w.interface, .format = format, .max = max } };
+
+    const chunk = try gpa.alloc(f32, opts.window);
+    defer gpa.free(chunk);
+
+    while (true) {
+        const n = dec.read(chunk) catch |e|
+            fatal(io, "{s}: {s}", .{ path, @errorName(e) });
+        if (n == 0) break;
+
+        analyzer.push(chunk[0..n], &emitter, Emitter.emit);
+        if (emitter.err) |e| {
+            if (e == error.WriteFailed or e == error.BrokenPipe) break;
+            return e;
+        }
+    }
+}
+
 fn fatal(io: std.Io, comptime fmt: []const u8, args: anytype) noreturn {
     var buf: [512]u8 = undefined;
     var w = std.Io.File.stderr().writer(io, &buf);
@@ -68,6 +132,7 @@ pub fn main(init: std.process.Init) !void {
     var max: u32 = 100;
     var target: ?[:0]const u8 = null;
     var app: ?[:0]const u8 = null;
+    var file: ?[:0]const u8 = null;
 
     var it = init.minimal.args.iterate();
     _ = it.next();
@@ -91,6 +156,8 @@ pub fn main(init: std.process.Init) !void {
             target = Need.val(&it, "--target", io);
         } else if (std.mem.eql(u8, arg, "--app")) {
             app = Need.val(&it, "--app", io);
+        } else if (std.mem.eql(u8, arg, "--file")) {
+            file = Need.val(&it, "--file", io);
         } else if (std.mem.eql(u8, arg, "--bands")) {
             opts.bands = std.fmt.parseInt(usize, Need.val(&it, "--bands", io), 10) catch
                 fatal(io, "--bands wants a number", .{});
@@ -115,6 +182,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--onset-hz")) {
             opts.onset_hz = std.fmt.parseFloat(f32, Need.val(&it, "--onset-hz", io)) catch
                 fatal(io, "--onset-hz wants a number", .{});
+        } else if (std.mem.eql(u8, arg, "--odf")) {
+            const v = Need.val(&it, "--odf", io);
+            opts.odf = std.meta.stringToEnum(cadence.analysis.Odf, v) orelse
+                fatal(io, "unknown odf '{s}'", .{v});
         } else if (std.mem.eql(u8, arg, "--onset-threshold")) {
             opts.onset_threshold = std.fmt.parseFloat(f32, Need.val(&it, "--onset-threshold", io)) catch
                 fatal(io, "--onset-threshold wants a number", .{});
@@ -142,8 +213,10 @@ pub fn main(init: std.process.Init) !void {
     if (opts.bands == 0) fatal(io, "--bands must be at least 1", .{});
     if (opts.low_hz <= 0 or opts.high_hz <= opts.low_hz)
         fatal(io, "need 0 < --low < --high", .{});
-    if (opts.high_hz > @as(f32, @floatFromInt(opts.rate)) / 2)
-        fatal(io, "--high is above nyquist for --rate {d}", .{opts.rate});
+
+    if (file) |path| return runFile(gpa, io, path, opts, format, max);
+
+    checkNyquist(io, opts);
 
     var analyzer = try cadence.Analyzer.init(gpa, opts);
     defer analyzer.deinit(gpa);
