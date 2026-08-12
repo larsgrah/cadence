@@ -8,6 +8,7 @@ pub const fft = @import("fft.zig");
 pub const stft = @import("stft.zig");
 pub const analysis = @import("analysis.zig");
 pub const tempo = @import("tempo.zig");
+pub const vocoder = @import("vocoder.zig");
 pub const output = @import("output.zig");
 
 pub const Fft = fft.Fft;
