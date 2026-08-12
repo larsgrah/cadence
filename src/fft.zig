@@ -81,6 +81,22 @@ pub const Fft = struct {
             }
         }
     }
+
+    /// The inverse, in place. Only the sign of the exponent and a 1/n differ
+    /// from the forward transform, so conjugating either side of `forward`
+    /// gets it without a second butterfly loop.
+    pub fn inverse(self: *const Fft, re: []f32, im: []f32) void {
+        std.debug.assert(re.len == self.n and im.len == self.n);
+
+        for (im) |*v| v.* = -v.*;
+        self.forward(re, im);
+
+        const s = 1.0 / @as(f32, @floatFromInt(self.n));
+        for (re, im) |*r, *i| {
+            r.* *= s;
+            i.* = -i.* * s;
+        }
+    }
 };
 
 test "dc only" {
@@ -94,6 +110,28 @@ test "dc only" {
 
     try std.testing.expectApproxEqAbs(@as(f32, 16.0), re[0], 1e-4);
     for (1..16) |k| try std.testing.expectApproxEqAbs(@as(f32, 0.0), re[k], 1e-3);
+}
+
+test "inverse undoes forward" {
+    const gpa = std.testing.allocator;
+    const n = 64;
+    var f = try Fft.init(gpa, n);
+    defer f.deinit(gpa);
+
+    var rng = std.Random.DefaultPrng.init(3);
+    const rand = rng.random();
+
+    var re: [n]f32 = undefined;
+    var im = [_]f32{0.0} ** n;
+    for (&re) |*v| v.* = rand.float(f32) * 2 - 1;
+    const orig = re;
+
+    f.forward(&re, &im);
+    f.inverse(&re, &im);
+
+    for (orig, re) |a, b| try std.testing.expectApproxEqAbs(a, b, 1e-5);
+    // real in, so the imaginary half has to come back empty
+    for (im) |v| try std.testing.expectApproxEqAbs(@as(f32, 0), v, 1e-5);
 }
 
 test "single bin sinusoid lands in that bin" {

@@ -5,6 +5,7 @@
 //! only reachable from the executable.
 
 pub const fft = @import("fft.zig");
+pub const stft = @import("stft.zig");
 pub const analysis = @import("analysis.zig");
 pub const tempo = @import("tempo.zig");
 pub const output = @import("output.zig");
