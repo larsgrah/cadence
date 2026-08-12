@@ -35,10 +35,10 @@ pub const Options = struct {
     high_hz: f32 = 12000,
     /// slow-decaying peak tracker, so output is 0..1 regardless of volume
     autogain: bool = true,
-    /// onsets come from flux below this only. full-spectrum flux fires on
-    /// every hi-hat, which is correct onset detection and useless for driving
-    /// something that should look like it is following the beat. the kick
-    /// lives under ~200Hz
+    /// onsets are measured from the bins below this only. the whole spectrum
+    /// fires on every hi-hat, which is correct onset detection and useless for
+    /// driving something that should look like it is following the beat. the
+    /// kick lives under ~200Hz
     onset_hz: f32 = 200,
     /// what the onset detector and the tempo model run on.
     ///
@@ -96,9 +96,13 @@ pub const Frame = struct {
     /// whole-mix level, 0..1. not a band average - it is weighted low, since
     /// that is what reads as "loud" to an eye watching a background
     amp: f32,
-    /// positive spectral flux this frame, 0..1 against its own history
-    flux: f32,
-    /// flux crossed the adaptive threshold and we are past the refractory gap
+    /// onset strength this frame, 0..1 against its own running peak. the
+    /// continuous version of `onset` - how hard the transient was, which the
+    /// boolean throws away. a consumer can pulse in proportion to a kick
+    /// instead of identically for every one
+    strength: f32,
+    /// strength crossed the adaptive threshold and we are past the
+    /// refractory gap
     onset: bool,
     /// estimated tempo, 0 when nothing convincing is there
     bpm: f32,
@@ -131,10 +135,11 @@ pub const Analyzer = struct {
     out_bands: []f32,
 
     /// ~0.6s of onset strength, the window the threshold averages over
-    flux_hist: []f32,
-    flux_peak: f32 = 1e-6,
-    flux_w: usize = 0,
-    flux_filled: usize = 0,
+    hist: []f32,
+    hist_w: usize = 0,
+    hist_filled: usize = 0,
+    /// slow-decaying peak, for reporting strength as 0..1
+    strength_peak: f32 = 1e-6,
 
     peak: f32 = 1e-6,
     refractory: usize = 0,
@@ -157,7 +162,7 @@ pub const Analyzer = struct {
             .band_lo = undefined,
             .band_hi = undefined,
             .out_bands = undefined,
-            .flux_hist = undefined,
+            .hist = undefined,
             .tempo = undefined,
         };
 
@@ -188,8 +193,8 @@ pub const Analyzer = struct {
         @memset(self.out_bands, 0);
 
         const hist_len = @max(8, (opts.rate * 6 / 10) / opts.hop);
-        self.flux_hist = try gpa.alloc(f32, hist_len);
-        @memset(self.flux_hist, 0);
+        self.hist = try gpa.alloc(f32, hist_len);
+        @memset(self.hist, 0);
 
         // the tempo model runs on the same onset strength the detector uses,
         // one value per hop
@@ -238,7 +243,7 @@ pub const Analyzer = struct {
         gpa.free(self.band_lo);
         gpa.free(self.band_hi);
         gpa.free(self.out_bands);
-        gpa.free(self.flux_hist);
+        gpa.free(self.hist);
         self.tempo.deinit(gpa);
         self.* = undefined;
     }
@@ -275,17 +280,16 @@ pub const Analyzer = struct {
         }
         self.fft.forward(self.re, self.im);
 
-        // `flux` is the reported one and stays magnitude only, full spectrum.
-        // `strength` is what drives onsets and tempo, from the bass bins by
-        // whichever odf is selected
-        var flux: f32 = 0;
+        // one number out of this loop: the onset strength, from the bass bins
+        // by whichever odf is selected. full-spectrum flux used to come out
+        // here too and is gone - it fired on every hi-hat, which is a correct
+        // measurement of something nothing wanted to watch
         var strength: f32 = 0;
         for (0..n / 2) |k| {
             const re = self.re[k];
             const im = self.im[k];
             const m = @sqrt(re * re + im * im);
             const d = m - self.prev_mag[k];
-            if (d > 0) flux += d;
 
             if (k < self.onset_bin) {
                 switch (self.opts.odf) {
@@ -339,7 +343,9 @@ pub const Analyzer = struct {
             amp = dbNorm(amp, self.opts.floor_db);
         }
 
-        const norm_flux = self.normalizedFlux(flux);
+        // normalised before the detector sees it, since the detector works off
+        // a ratio to its own running mean and does not care about the scale
+        const norm_strength = self.normalizedStrength(strength);
         const onset = self.detectOnset(strength);
 
         // the tempo model gets the same onset strength the detector saw, not
@@ -350,7 +356,7 @@ pub const Analyzer = struct {
         return .{
             .bands = self.out_bands,
             .amp = amp,
-            .flux = norm_flux,
+            .strength = norm_strength,
             .onset = onset,
             .bpm = beat.bpm,
             .phase = beat.phase,
@@ -358,29 +364,30 @@ pub const Analyzer = struct {
         };
     }
 
-    /// Full-spectrum flux against its own slow-decaying peak. It gets its own
-    /// tracker rather than sharing the onset history, which is bass only.
-    fn normalizedFlux(self: *Analyzer, flux: f32) f32 {
-        self.flux_peak = @max(self.flux_peak * 0.999, flux);
-        return @min(1.0, flux / @max(self.flux_peak, 1e-6));
+    /// Against a slow-decaying peak, so the number means the same thing at any
+    /// volume. Its own tracker rather than the onset history's mean, which is
+    /// a much shorter window and is there to answer a different question.
+    fn normalizedStrength(self: *Analyzer, strength: f32) f32 {
+        self.strength_peak = @max(self.strength_peak * 0.999, strength);
+        return @min(1.0, strength / @max(self.strength_peak, 1e-6));
     }
 
     fn detectOnset(self: *Analyzer, strength: f32) bool {
-        const n = @min(self.flux_filled, self.flux_hist.len);
+        const n = @min(self.hist_filled, self.hist.len);
         var mean: f32 = 0;
-        for (self.flux_hist[0..n]) |v| mean += v;
+        for (self.hist[0..n]) |v| mean += v;
         if (n > 0) mean /= @floatFromInt(n);
 
-        self.flux_hist[self.flux_w] = strength;
-        self.flux_w = (self.flux_w + 1) % self.flux_hist.len;
-        if (self.flux_filled < self.flux_hist.len) self.flux_filled += 1;
+        self.hist[self.hist_w] = strength;
+        self.hist_w = (self.hist_w + 1) % self.hist.len;
+        if (self.hist_filled < self.hist.len) self.hist_filled += 1;
 
         if (self.refractory > 0) {
             self.refractory -= 1;
             return false;
         }
         // needs most of the history before a threshold means anything
-        if (n < self.flux_hist.len / 2) return false;
+        if (n < self.hist.len / 2) return false;
         if (strength <= mean * self.opts.onset_threshold or strength <= 1e-5) return false;
 
         self.refractory = (self.opts.rate * self.opts.onset_refractory_ms / 1000) / self.opts.hop;
@@ -522,6 +529,55 @@ test "a kick every half second fires onsets under either odf" {
         try std.testing.expect(c.n >= 5);
         try std.testing.expect(c.n <= 12);
     }
+}
+
+test "strength stands up on the kick and falls back between" {
+    // the whole point of reporting it: a consumer that only had the boolean
+    // pulses the same amount for every hit. if strength on an onset frame is
+    // not well clear of a typical frame it is saying nothing the boolean did
+    // not already say
+    const gpa = std.testing.allocator;
+    const total: usize = 48000 * 3;
+
+    const in = try gpa.alloc(f32, total);
+    defer gpa.free(in);
+    const period: usize = 48000 / 2;
+    for (in, 0..) |*v, i| {
+        const t = @as(f32, @floatFromInt(i % period)) / 48000.0;
+        v.* = @exp(-t * 25.0) * @sin(2.0 * std.math.pi * 60.0 * t);
+    }
+
+    var a = try Analyzer.init(gpa, .{});
+    defer a.deinit(gpa);
+
+    const Watch = struct {
+        on_sum: f32 = 0,
+        on_n: usize = 0,
+        all_sum: f32 = 0,
+        all_n: usize = 0,
+        max: f32 = 0,
+
+        fn take(self: *@This(), f: Frame) void {
+            self.all_sum += f.strength;
+            self.all_n += 1;
+            self.max = @max(self.max, f.strength);
+            if (f.onset) {
+                self.on_sum += f.strength;
+                self.on_n += 1;
+            }
+        }
+    };
+    var w: Watch = .{};
+    a.push(in, &w, Watch.take);
+
+    try std.testing.expect(w.on_n > 3);
+    const on_mean = w.on_sum / @as(f32, @floatFromInt(w.on_n));
+    const all_mean = w.all_sum / @as(f32, @floatFromInt(w.all_n));
+
+    try std.testing.expect(on_mean > all_mean * 3);
+    // normalised against a running peak, so it reaches the top and stays in
+    // range whatever the volume was
+    try std.testing.expect(w.max > 0.5 and w.max <= 1.0);
 }
 
 test "silence stays at zero and does not fire onsets" {
