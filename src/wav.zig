@@ -94,7 +94,9 @@ pub const Decoder = struct {
                     .remaining = size,
                 };
             } else {
-                try r.discardAll(size + (size & 1)); // chunks pad to even
+                // widened before the pad is added, or a chunk claiming
+                // 0xFFFFFFFF overflows the add. chunks pad to even
+                try r.discardAll(@as(usize, size) + (size & 1));
             }
         }
     }
@@ -295,6 +297,17 @@ test "a chunk in the way gets skipped" {
     var out: [4]f32 = undefined;
     try testing.expectEqual(@as(usize, 1), try d.read(&out));
     try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-4);
+}
+
+test "a chunk claiming four gigabytes is refused rather than overflowing" {
+    var buf: [64]u8 = undefined;
+    @memcpy(buf[0..12], "RIFF\x00\x00\x00\x00WAVE");
+    @memcpy(buf[12..16], "JUNK");
+    std.mem.writeInt(u32, buf[16..20], 0xFFFFFFFF, .little);
+    @memset(buf[20..], 0);
+
+    var r = std.Io.Reader.fixed(&buf);
+    try testing.expectError(error.EndOfStream, Decoder.init(&r));
 }
 
 test "not a wav is refused rather than guessed at" {
