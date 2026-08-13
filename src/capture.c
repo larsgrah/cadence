@@ -23,7 +23,6 @@
  * matches, find its output ports, and create a link from each of them to our
  * own input port through the link factory. Several outputs into one input is
  * how pipewire mixes, so a stereo application arrives already summed. */
-#define MAX_PORTS 128
 #define MAX_LINKS 16
 
 struct port {
@@ -46,8 +45,9 @@ struct cadence_capture {
 	uint32_t our_node;
 	uint32_t our_input;
 
-	struct port ports[MAX_PORTS];
+	struct port *ports;
 	uint32_t port_count;
+	uint32_t port_cap;
 
 	struct pw_proxy *links[MAX_LINKS];
 	uint32_t linked_from[MAX_LINKS];
@@ -63,6 +63,9 @@ struct cadence_capture {
 	_Atomic uint32_t head; /* write */
 	_Atomic uint32_t tail; /* read */
 	_Atomic uint64_t dropped;
+
+	/* reader side only, so no atomic. the last dropped count it acted on */
+	uint64_t seen_dropped;
 
 	sem_t sem;
 	_Atomic int running;
@@ -87,6 +90,27 @@ static int contains_ci(const char *hay, const char *needle)
 			return 1;
 	}
 	return 0;
+}
+
+/* The registry hands out every port in the graph, not just the ones we want,
+ * and a desktop with a browser open has well over a hundred. This grows rather
+ * than capping: a cap that fills before the target's ports arrive stops the
+ * capture attaching at all, and looks exactly like the application not
+ * playing. Returns 0 only if the allocation failed. */
+static int port_push(cadence_capture *c, uint32_t id, uint32_t node_id, int is_output)
+{
+	if (c->port_count == c->port_cap) {
+		uint32_t cap = c->port_cap ? c->port_cap * 2 : 64;
+		struct port *p = realloc(c->ports, cap * sizeof(*p));
+		if (p == NULL)
+			return 0;
+		c->ports = p;
+		c->port_cap = cap;
+	}
+	c->ports[c->port_count++] = (struct port){
+		.id = id, .node_id = node_id, .is_output = is_output
+	};
+	return 1;
 }
 
 /* Links every known output port of the target node to our input port. Safe to
@@ -178,12 +202,8 @@ static void on_global(void *userdata, uint32_t id, uint32_t permissions,
 		uint32_t node_id = (uint32_t)strtoul(node_s, NULL, 10);
 		int is_output = spa_streq(dir, "out");
 
-		if (c->port_count < MAX_PORTS) {
-			c->ports[c->port_count++] = (struct port){
-				.id = id, .node_id = node_id, .is_output = is_output
-			};
+		if (port_push(c, id, node_id, is_output))
 			relink(c);
-		}
 		return;
 	}
 
@@ -264,23 +284,24 @@ static void on_process(void *userdata)
 		uint32_t tail = atomic_load_explicit(&c->tail, memory_order_acquire);
 		uint32_t space = (c->mask + 1) - (head - tail);
 
-		/* a reader that fell behind gets the newest samples, not the
-		 * oldest. a visualiser that catches up by replaying history is
-		 * worse than one that skips */
+		/* no room, so the whole buffer goes rather than the part of it
+		 * that fits. the reader resyncs to live when it sees the dropped
+		 * count move, so anything squeezed in here is only samples it is
+		 * about to skip past anyway */
 		if (n > space) {
-			atomic_fetch_add_explicit(&c->dropped, n - space, memory_order_relaxed);
-			src += n - space;
-			n = space;
+			atomic_fetch_add_explicit(&c->dropped, n, memory_order_relaxed);
+		} else {
+			for (uint32_t i = 0; i < n; i++)
+				c->ring[(head + i) & c->mask] = src[i];
+
+			atomic_store_explicit(&c->head, head + n, memory_order_release);
+
+			/* one post per wakeup, not one per buffer. the reader
+			 * drains everything it finds, so a backlog of posts just
+			 * spins it */
+			if (atomic_exchange_explicit(&c->posted, 1, memory_order_acq_rel) == 0)
+				sem_post(&c->sem);
 		}
-		for (uint32_t i = 0; i < n; i++)
-			c->ring[(head + i) & c->mask] = src[i];
-
-		atomic_store_explicit(&c->head, head + n, memory_order_release);
-
-		/* one post per wakeup, not one per buffer. the reader drains
-		 * everything it finds, so a backlog of posts just spins it */
-		if (atomic_exchange_explicit(&c->posted, 1, memory_order_acq_rel) == 0)
-			sem_post(&c->sem);
 	}
 
 	pw_stream_queue_buffer(c->stream, b);
@@ -463,6 +484,19 @@ uint32_t cadence_read(cadence_capture *c, float *dst, uint32_t max)
 
 		uint32_t tail = atomic_load_explicit(&c->tail, memory_order_relaxed);
 		uint32_t head = atomic_load_explicit(&c->head, memory_order_acquire);
+
+		/* the writer threw a buffer away, so everything still sitting in
+		 * the ring is older than what was lost. jump to live rather than
+		 * working through a backlog that is stale before it is read. a
+		 * visualiser that catches up by replaying history is worse than
+		 * one that skips */
+		uint64_t dropped = atomic_load_explicit(&c->dropped, memory_order_relaxed);
+		if (dropped != c->seen_dropped) {
+			c->seen_dropped = dropped;
+			tail = head;
+			atomic_store_explicit(&c->tail, tail, memory_order_release);
+		}
+
 		uint32_t avail = head - tail;
 
 		if (avail > 0) {
@@ -510,6 +544,7 @@ void cadence_close(cadence_capture *c)
 	sem_destroy(&c->sem);
 	free(c->app);
 	free(c->target);
+	free(c->ports);
 	free(c->ring);
 	free(c);
 }
