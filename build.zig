@@ -11,6 +11,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // audio out, which is pipewire and therefore not part of the dsp module.
+    // its own module rather than a library artifact, so a dependent imports
+    // it and gets the C, the include path and the system libs with it
+    const playback = b.addModule("playback", .{
+        .root_source_file = b.path("src/playback.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    playback.linkSystemLibrary("libpipewire-0.3", .{});
+    playback.linkSystemLibrary("libspa-0.2", .{});
+    playback.addIncludePath(b.path("src"));
+    playback.addCSourceFile(.{
+        .file = b.path("src/playback.c"),
+        .flags = &.{ "-std=gnu11", "-D_GNU_SOURCE", "-Wall", "-Wextra" },
+    });
+
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
