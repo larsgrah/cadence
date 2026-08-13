@@ -131,6 +131,38 @@ pub const Decoder = struct {
         }
         return n;
     }
+
+    /// The same, without the downmix. Fills `out` with interleaved frames and
+    /// returns how many frames, so `out` wants room for a whole number of
+    /// them.
+    ///
+    /// The analyzer has no use for this - it asks pipewire for one channel and
+    /// averages a file to match. It is here for callers that are loading audio
+    /// rather than measuring it, where throwing a stereo image away is not a
+    /// simplification but a loss.
+    pub fn readInterleaved(self: *Decoder, out: []f32) !usize {
+        const width = self.bits / 8;
+        const frame = width * @as(usize, self.channels);
+        const want = out.len / self.channels;
+
+        var n: usize = 0;
+        while (n < want and self.remaining >= frame) {
+            for (0..self.channels) |c| {
+                const raw = self.r.take(width) catch |e| switch (e) {
+                    error.EndOfStream => {
+                        self.remaining = 0;
+                        // a frame that ran out partway is not a frame
+                        return n;
+                    },
+                    else => return e,
+                };
+                out[n * self.channels + c] = sample(raw, self.bits, self.encoding);
+            }
+            n += 1;
+            self.remaining -= frame;
+        }
+        return n;
+    }
 };
 
 fn sample(raw: []const u8, bits: u16, encoding: Encoding) f32 {
@@ -235,6 +267,44 @@ test "stereo averages down to mono" {
     try testing.expectEqual(@as(usize, 2), try d.read(&out));
     try testing.expectApproxEqAbs(@as(f32, 0.25), out[0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 0.5), out[1], 1e-4);
+}
+
+test "interleaved keeps the channels apart" {
+    var buf: [256]u8 = undefined;
+    var data: [8]u8 = undefined;
+    // one frame hard left, one frame the same both sides
+    std.mem.writeInt(i16, data[0..2], 16384, .little);
+    std.mem.writeInt(i16, data[2..4], 0, .little);
+    std.mem.writeInt(i16, data[4..6], 16384, .little);
+    std.mem.writeInt(i16, data[6..8], 16384, .little);
+
+    const bytes = buildWav(&buf, tag_pcm, 2, 48000, 16, &data);
+    var r = std.Io.Reader.fixed(bytes);
+    var d = try Decoder.init(&r);
+
+    var out: [8]f32 = undefined;
+    try testing.expectEqual(@as(usize, 2), try d.readInterleaved(&out));
+    // the same file that read() averages to 0.25 and 0.5
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), out[1], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[2], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), out[3], 1e-4);
+}
+
+test "interleaved stops on a whole frame" {
+    var buf: [256]u8 = undefined;
+    var data: [8]u8 = undefined;
+    for (0..4) |i| std.mem.writeInt(i16, data[i * 2 ..][0..2], 16384, .little);
+
+    const bytes = buildWav(&buf, tag_pcm, 2, 48000, 16, &data);
+    var r = std.Io.Reader.fixed(bytes);
+    var d = try Decoder.init(&r);
+
+    // room for three samples is room for one stereo frame, not one and a half
+    var out: [3]f32 = undefined;
+    try testing.expectEqual(@as(usize, 1), try d.readInterleaved(&out));
+    try testing.expectEqual(@as(usize, 1), try d.readInterleaved(&out));
+    try testing.expectEqual(@as(usize, 0), try d.readInterleaved(&out));
 }
 
 test "32 bit float passes through" {
