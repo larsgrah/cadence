@@ -112,8 +112,13 @@ pub const Tempo = struct {
         if (self.odf_filled < self.odf.len) self.odf_filled += 1;
 
         self.since_estimate += 1;
+        // the whole ring, not just enough of it for the longest lag. mean,
+        // variance and correlation all run over every slot, so slots that
+        // have not been written are zeros that correlate with each other at
+        // every lag and invent a confident tempo. init already sizes the ring
+        // past max_lag * 2, so a full one always has enough to correlate
         if (self.since_estimate >= self.opts.estimate_every and
-            self.odf_filled >= self.max_lag * 2)
+            self.odf_filled >= self.odf.len)
         {
             self.since_estimate = 0;
             self.estimate();
@@ -343,6 +348,24 @@ test "silence does not lock" {
     while (i < 60 * 10) : (i += 1) last = t.push(0, false);
 
     try std.testing.expect(!last.locked());
+}
+
+test "nothing is claimed before the history has filled" {
+    // the ring is longer than the shortest span that can be correlated, and
+    // the slots past the write head are zeros. correlating those against each
+    // other used to hand back a confident tempo about two seconds in, which a
+    // consumer gating on min_confidence would follow
+    const gpa = std.testing.allocator;
+    var t = try Tempo.init(gpa, .{ .fps = 100 });
+    defer t.deinit(gpa);
+
+    var rng = std.Random.DefaultPrng.init(11);
+    const rand = rng.random();
+
+    var i: usize = 0;
+    while (i < t.odf.len - 1) : (i += 1) {
+        try std.testing.expect(!t.push(rand.float(f32), false).locked());
+    }
 }
 
 test "noise does not produce a confident lock" {
